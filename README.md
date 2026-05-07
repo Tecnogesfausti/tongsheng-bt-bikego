@@ -4,6 +4,7 @@ Proyecto de ingeniería y pruebas BLE para display Tongsheng (EKD01-TB) con:
 
 - `esp32c3-ble-bridge`: MITM BLE en ESP32-C3 (puente teléfono <-> display).
 - `esp32c3-ekd01-tb-mock`: base de emulador/mock BLE del display EKD01-TB.
+- `vamosbici`: APK mínima de navegación offline (PoC pasos -> futuro BLE nav).
 - `ble-handshake-apk`: APK Android para escaneo, conexión, handshake, comandos y pruebas de navegación BLE.
 
 ## Estructura
