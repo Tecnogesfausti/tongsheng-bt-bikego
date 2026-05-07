@@ -73,6 +73,8 @@ uint16_t g_speedRaw = 0;  // speed*10
 unsigned long g_lastNotifyMs = 0;
 uint8_t g_seq10 = 0xC3;
 uint8_t g_challenge[4] = {0x47, 0x5A, 0x61, 0x13};
+unsigned long g_lastBatteryTickMs = 0;
+int g_batteryDir = -1; // drain then charge to look alive
 
 enum SoloInitState : uint8_t {
   SOLO_IDLE = 0,
@@ -392,6 +394,9 @@ static void drawUi() {
   tft.print("% SPD:");
   tft.print(((float)g_speedRaw) / 10.0f, 1);
 
+  tft.setCursor(x, 188);
+  tft.print("BTN20:+5 BTN21:-5");
+
   tft.setCursor(x, 192);
   tft.print("Last TX:");
   tft.setCursor(x, 174);
@@ -568,19 +573,9 @@ void setup() {
 void loop() {
   int btn = digitalRead(PIN_BTN_POLL);
   if (btn == LOW && g_lastPollBtn == HIGH && (millis() - g_lastPollBtnMs) > 220) {
-    if (g_soloState == SOLO_IDLE || g_soloState == SOLO_FAILED || g_soloState == SOLO_RUN_POLL) {
-      if (g_soloState == SOLO_RUN_POLL) {
-        g_pollMode = false;
-        g_soloState = SOLO_IDLE;
-        Serial.println("[SOLO] STOP");
-      } else {
-        startSoloProcess();
-      }
-    } else {
-      g_soloState = SOLO_FAILED;
-      g_pollMode = false;
-      Serial.println("[SOLO] ABORT");
-    }
+    // GPIO20: increase speed by +5 raw (0.5 units shown by display app)
+    if (g_speedRaw <= 995) g_speedRaw += 5;
+    Serial.printf("[BTN20] speed_raw=%u\n", (unsigned)g_speedRaw);
     g_lastPollBtnMs = millis();
   }
   g_lastPollBtn = btn;
@@ -588,42 +583,31 @@ void loop() {
   int btnLight = digitalRead(PIN_BTN_LIGHT);
   if (btnLight == LOW && g_lastLightBtn == HIGH && (millis() - g_lastLightBtnMs) > 220) {
     g_lastLightBtnMs = millis();
-    if (g_displayConnected) {
-      g_lightStep = 1; // start ON->OFF->ON sequence
-      g_lightStepMs = 0;
-      Serial.println("[LIGHT] Sequence requested via GPIO21");
-    } else {
-      Serial.println("[LIGHT] Ignored, display not connected");
-    }
+    // GPIO21: decrease speed by -5 raw, floor at 0
+    if (g_speedRaw >= 5) g_speedRaw -= 5;
+    else g_speedRaw = 0;
+    Serial.printf("[BTN21] speed_raw=%u\n", (unsigned)g_speedRaw);
   }
   g_lastLightBtn = btnLight;
 
   if (g_phoneConnected && (millis() - g_lastNotifyMs > 400)) {
     g_lastNotifyMs = millis();
-    if (g_speedRaw < 220) g_speedRaw += 2;
-    else g_speedRaw = 0;
     sendState15();
     sendState10();
   }
 
-  if (g_lightStep != 0 && g_displayConnected) {
-    unsigned long now = millis();
-    if (g_lightStep == 1) {
-      g_light = 1;
-      Serial.println("[LIGHT] ON");
-      g_lightStep = 2;
-      g_lightStepMs = now;
-    } else if (g_lightStep == 2 && (now - g_lightStepMs) > 350) {
-      g_light = 0;
-      Serial.println("[LIGHT] OFF");
-      g_lightStep = 3;
-      g_lightStepMs = now;
-    } else if (g_lightStep == 3 && (now - g_lightStepMs) > 350) {
-      g_light = 1;
-      Serial.println("[LIGHT] ON");
-      g_lightStep = 0;
-      Serial.println("[LIGHT] Sequence done");
+  // Fake battery animation (slow drift)
+  if (millis() - g_lastBatteryTickMs > 3000) {
+    g_lastBatteryTickMs = millis();
+    int next = (int)g_battery + g_batteryDir;
+    if (next <= 20) {
+      next = 20;
+      g_batteryDir = +1;
+    } else if (next >= 95) {
+      next = 95;
+      g_batteryDir = -1;
     }
+    g_battery = (uint8_t)next;
   }
 
   static unsigned long lastSec = 0;
