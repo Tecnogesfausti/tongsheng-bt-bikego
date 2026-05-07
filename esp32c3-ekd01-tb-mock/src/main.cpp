@@ -27,7 +27,6 @@ static NimBLEUUID NUS_TX_UUID("6e400003-b5a3-f393-e0a9-e50e24dcca9e");   // noti
 // ===== Bridge config =====
 static const char *ADV_NAME = "EKD01-TB ";   // note trailing space (seen on real device)
 // Put your real display MAC here to avoid connecting to ourselves.
-static const char *REAL_DISPLAY_MAC = "70:DE:F9:D3:B2:52";
 static const char *SPOOF_BLE_MAC = "70:DE:F9:D3:B2:4E";
 // Manufacturer data to clone (edit as needed). First 2 bytes are Company ID (little-endian).
 static const uint8_t ADV_MFG_DATA[] = {0x59, 0x00, 0x01, 0x02, 0x03, 0x04};
@@ -40,12 +39,8 @@ NimBLECharacteristic *g_charPhoneWrite = nullptr;
 NimBLECharacteristic *g_charPhoneNotify = nullptr;
 NimBLEAdvertising *g_adv = nullptr;
 
-NimBLEClient *g_client = nullptr;
-NimBLERemoteCharacteristic *g_charDisplayWrite = nullptr;
-NimBLERemoteCharacteristic *g_charDisplayNotify = nullptr;
-
 bool g_phoneConnected = false;
-bool g_displayConnected = false;
+bool g_displayConnected = true; // mock always "has display"
 bool g_phoneConnecting = false;
 uint32_t g_txPhoneToDisplay = 0;
 uint32_t g_txDisplayToPhone = 0;
@@ -56,7 +51,7 @@ unsigned long g_lastUiMs = 0;
 uint32_t g_uptimeSec = 0;
 bool g_beat = false;
 bool g_logEnabled = true;
-static constexpr bool ENABLE_MOCK_HANDSHAKE = false;
+static constexpr bool ENABLE_MOCK_HANDSHAKE = true;
 unsigned long g_lastStatsMs = 0;
 bool g_pollMode = false;
 int g_lastPollBtn = HIGH;
@@ -69,6 +64,15 @@ static const uint8_t BIKEGO_AES_KEY[16] = {
   0x32, 0x43, 0x54, 0x44, 0x55, 0x34, 0x30, 0x71,
   0x4E, 0x79, 0x43, 0x67, 0x54, 0x6A, 0x62, 0x31
 };
+uint8_t g_assist = 1;
+uint8_t g_light = 0;
+uint8_t g_brightness = 4; // 1..4
+uint8_t g_unitMph = 0;    // 0 kmh, 1 mph
+uint8_t g_battery = 85;
+uint16_t g_speedRaw = 0;  // speed*10
+unsigned long g_lastNotifyMs = 0;
+uint8_t g_seq10 = 0xC3;
+uint8_t g_challenge[4] = {0x47, 0x5A, 0x61, 0x13};
 
 enum SoloInitState : uint8_t {
   SOLO_IDLE = 0,
@@ -93,17 +97,9 @@ static uint16_t bikegoCrc16Like(const uint8_t *data, size_t len) {
 }
 
 static bool writeDisplayFrame(const uint8_t *buf, size_t len) {
-  if (!g_displayConnected || !g_charDisplayWrite) return false;
-  bool ok = g_charDisplayWrite->writeValue(buf, len, false);
-  if (ok) {
-    g_txPhoneToDisplay++;
-    g_lastTx = hexOf(buf, len, len);
-    Serial.printf("[POLL TX] %s\n", g_lastTx.c_str());
-  } else {
-    g_errors++;
-    Serial.println("[ERR] Poll write to display failed");
-  }
-  return ok;
+  (void)buf;
+  (void)len;
+  return false;
 }
 
 static void startSoloProcess() {
@@ -187,7 +183,7 @@ static bool isBikegoReadChallengeCmd01(const uint8_t *data, size_t len) {
 static void sendMockChallengeResp() {
   if (!g_phoneConnected || !g_charPhoneNotify) return;
   // 0x04 means read response in Bikego parser; 4-byte payload at bytes 7..10.
-  uint8_t resp[13] = {0x55, 0xAA, 0x04, 0x11, 0x10, 0x04, 0x00, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00};
+  uint8_t resp[13] = {0x55, 0xAA, 0x04, 0x10, 0x11, 0x04, 0x00, g_challenge[0], g_challenge[1], g_challenge[2], g_challenge[3], 0x00, 0x00};
   uint16_t crc = bikegoCrc16Like(resp, sizeof(resp));
   resp[11] = static_cast<uint8_t>(crc & 0xFF);
   resp[12] = static_cast<uint8_t>((crc >> 8) & 0xFF);
@@ -200,7 +196,7 @@ static void sendMockChallengeResp() {
 
 static void sendMockAuthAckSuccess() {
   if (!g_phoneConnected || !g_charPhoneNotify) return;
-  uint8_t ack[10] = {0x55, 0xAA, 0x01, 0x11, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00};
+  uint8_t ack[10] = {0x55, 0xAA, 0x01, 0x10, 0x11, 0x20, 0x00, 0x00, 0x00, 0x00};
   uint16_t crc = bikegoCrc16Like(ack, sizeof(ack));
   ack[8] = static_cast<uint8_t>(crc & 0xFF);
   ack[9] = static_cast<uint8_t>((crc >> 8) & 0xFF);
@@ -209,6 +205,82 @@ static void sendMockAuthAckSuccess() {
   g_txDisplayToPhone++;
   g_lastRx = hexOf(ack, sizeof(ack));
   Serial.printf("[MOCK RX->P] %s\n", g_lastRx.c_str());
+}
+
+static void sendNotifyFrame(const uint8_t *buf, size_t len) {
+  if (!g_phoneConnected || !g_charPhoneNotify) return;
+  g_charPhoneNotify->setValue(buf, len);
+  g_charPhoneNotify->notify();
+  g_txDisplayToPhone++;
+  g_lastRx = hexOf(buf, len, len);
+  if (g_logEnabled) Serial.printf("[MOCK RX->P] %s\n", g_lastRx.c_str());
+}
+
+static void sendA5ReadResp88() {
+  uint8_t r[32] = {0x55, 0xAA, 0x18, 0xA5, 0x11, 0x04, 0x88};
+  const char *name = "EKD01-TB ";
+  for (int i = 0; i < 24; i++) r[7 + i] = (i < (int)strlen(name)) ? (uint8_t)name[i] : 0x00;
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[30] = (uint8_t)(crc & 0xFF);
+  r[31] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
+}
+
+static void sendA5ReadResp18() {
+  uint8_t r[32] = {0x55, 0xAA, 0x18, 0xA5, 0x11, 0x04, 0x18};
+  const char *name = "EKD01_TB_N22";
+  for (int i = 0; i < 24; i++) r[7 + i] = (i < (int)strlen(name)) ? (uint8_t)name[i] : 0x00;
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[30] = (uint8_t)(crc & 0xFF);
+  r[31] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
+}
+
+static void sendA5WriteAck(uint8_t off) {
+  uint8_t r[10] = {0x55, 0xAA, 0x01, 0xA5, 0x11, 0x05, off, 0x00, 0x00, 0x00};
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[8] = (uint8_t)(crc & 0xFF);
+  r[9] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
+}
+
+static void sendPollAck(uint8_t off, uint8_t val) {
+  uint8_t r[10] = {0x55, 0xAA, 0x01, 0x10, 0x11, 0x05, off, val, 0x00, 0x00};
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[8] = (uint8_t)(crc & 0xFF);
+  r[9] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
+}
+
+static void sendF101Resp() {
+  uint8_t r[34] = {
+      0x55, 0xAA, 0x1A, 0xF1, 0x11, 0x04, 0x01, 0x00, 0x00, 0x56, 0x07, 0x00,
+      0x00, 0x0A, 0xA8, 0x89, 0x8B, 0x07, 0x0A, 0x14, 0x64, 0x00, 0x2C, 0x01,
+      0x01, 0x02, 0x32, 0x00, 0xF4, 0x01, 0x01, 0x09, 0x00, 0x00};
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[32] = (uint8_t)(crc & 0xFF);
+  r[33] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
+}
+
+static void sendState15() {
+  uint8_t r[30] = {0x55, 0xAA, 0x15, 0x10, 0x11, 0x06, 0x01, 0x00, 0x00, 0x00, 0x01,
+                   g_light, g_assist, 0x05, g_battery, 0x01, (uint8_t)(g_speedRaw & 0xFF), (uint8_t)(g_speedRaw >> 8),
+                   0x8C, 0x06, 0x00, 0x00, 0xF3, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[28] = (uint8_t)(crc & 0xFF);
+  r[29] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
+}
+
+static void sendState10() {
+  uint8_t r[24] = {0x55, 0xAA, 0x10, 0x10, 0x11, 0x06, 0x09, g_seq10, 0x0E, 0x00, 0x00, 0x3D,
+                   0x06, 0x88, 0x01, 0x18, 0x01, 0x1E, 0x00, (uint8_t)(0x40 + g_brightness), g_unitMph, 0x01, 0x00, 0x00};
+  g_seq10++;
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[22] = (uint8_t)(crc & 0xFF);
+  r[23] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
 }
 
 static String hexOf(const uint8_t *data, size_t len, size_t maxLen) {
@@ -260,7 +332,7 @@ static void drawUi() {
   tft.setTextColor(0xFFFF);
   tft.setTextSize(2);
   tft.setCursor(42, 14);
-  tft.print("BLE BRIDGE");
+  tft.print("EKD01 MOCK");
 
   tft.setTextSize(1);
   const int x = 26; // shift content towards center for circular display
@@ -279,8 +351,7 @@ static void drawUi() {
   }
 
   tft.setCursor(x, 74);
-  tft.print("DISPLAY: ");
-  tft.print(g_displayConnected ? "CONNECTED" : "WAIT");
+  tft.print("DISPLAY: MOCK");
 
   tft.setCursor(x, 90);
   tft.print("TX P->D: ");
@@ -303,14 +374,32 @@ static void drawUi() {
   tft.print("LOG: ");
   tft.print(g_logEnabled ? "ON" : "OFF");
 
-  tft.setCursor(x, 162);
+  tft.setCursor(x, 154);
+  tft.print("ASSIST:");
+  tft.print(g_assist);
+  tft.print(" L:");
+  tft.print(g_light ? "ON" : "OFF");
+
+  tft.setCursor(x, 166);
+  tft.print("UNIT:");
+  tft.print(g_unitMph ? "MPH" : "KMH");
+  tft.print(" B:");
+  tft.print(g_brightness);
+
+  tft.setCursor(x, 178);
+  tft.print("BATT:");
+  tft.print(g_battery);
+  tft.print("% SPD:");
+  tft.print(((float)g_speedRaw) / 10.0f, 1);
+
+  tft.setCursor(x, 192);
   tft.print("Last TX:");
   tft.setCursor(x, 174);
   tft.print(g_lastTx);
 
-  tft.setCursor(x, 198);
+  tft.setCursor(x, 206);
   tft.print("Last RX:");
-  tft.setCursor(x, 210);
+  tft.setCursor(x, 218);
   tft.print(g_lastRx);
 
   // Heartbeat indicator: green/red dot toggles every second.
@@ -357,144 +446,45 @@ class PhoneWriteCallbacks : public NimBLECharacteristicCallbacks {
     if (ENABLE_MOCK_HANDSHAKE && isBikegoAuthCmd20(raw, rawLen)) {
       Serial.println("[MOCK] Intercepted cmd 0x20 auth; sending success ACK");
       sendMockAuthAckSuccess();
+      return;
     }
     if (ENABLE_MOCK_HANDSHAKE && isBikegoReadChallengeCmd01(raw, rawLen)) {
       Serial.println("[MOCK] Intercepted cmd 0x01 challenge read; sending 4-byte challenge");
       sendMockChallengeResp();
+      return;
     }
-
-    if (g_displayConnected && g_charDisplayWrite) {
-      bool ok = g_charDisplayWrite->writeValue(raw, rawLen, false);
-      if (ok) {
-        g_txPhoneToDisplay++;
-      } else {
-        g_errors++;
-        Serial.println("[ERR] Write to display failed");
-      }
-    } else {
-      g_errors++;
-      Serial.println("[WARN] Display not connected, drop TX");
+    // A5 read
+    if (rawLen >= 10 && raw[0] == 0x55 && raw[1] == 0xAA && raw[3] == 0x11 && raw[4] == 0xA5 && raw[5] == 0x01) {
+      if (raw[6] == 0x88) sendA5ReadResp88();
+      if (raw[6] == 0x18) sendA5ReadResp18();
+      if (raw[6] == 0xE0) sendA5WriteAck(0xE0);
+      return;
+    }
+    // A5 write
+    if (rawLen >= 11 && raw[0] == 0x55 && raw[1] == 0xAA && raw[3] == 0x11 && raw[4] == 0xA5 && raw[5] == 0x02) {
+      uint8_t off = raw[6];
+      uint8_t val = raw[7];
+      if (off == 0xA4) g_assist = val;
+      if (off == 0xA6) g_light = (val ? 1 : 0);
+      if (off == 0xA7) g_brightness = (val >= 1 && val <= 4) ? val : g_brightness;
+      if (off == 0xE0) g_unitMph = (val ? 1 : 0);
+      sendA5WriteAck(off);
+      return;
+    }
+    // F1 query
+    if (rawLen >= 10 && raw[0] == 0x55 && raw[1] == 0xAA && raw[3] == 0x11 && raw[4] == 0xF1 && raw[5] == 0x01) {
+      sendF101Resp();
+      return;
+    }
+    // Poll requests 42/46
+    if (rawLen >= 13 && raw[0] == 0x55 && raw[1] == 0xAA && raw[3] == 0x11 && raw[4] == 0x10 && raw[5] == 0x02) {
+      if (raw[6] == 0x42) sendPollAck(0x42, 0x01);
+      if (raw[6] == 0x46) sendPollAck(0x46, 0x00);
+      return;
     }
   }
 };
 
-class ClientCallbacks : public NimBLEClientCallbacks {
-  void onConnect(NimBLEClient *pClient) override {
-    Serial.printf("[DISPLAY] Connected: %s\n", pClient->getPeerAddress().toString().c_str());
-    g_displayConnected = true;
-  }
-
-  void onDisconnect(NimBLEClient *pClient) override {
-    (void)pClient;
-    Serial.println("[DISPLAY] Disconnected");
-    g_displayConnected = false;
-    g_charDisplayWrite = nullptr;
-    g_charDisplayNotify = nullptr;
-  }
-
-  bool onConnParamsUpdateRequest(NimBLEClient *pClient, const ble_gap_upd_params *params) override {
-    (void)pClient;
-    (void)params;
-    return true;
-  }
-};
-
-static void onDisplayNotify(NimBLERemoteCharacteristic *pRC, uint8_t *pData, size_t length, bool isNotify) {
-  (void)pRC;
-  g_lastRx = hexOf(pData, length, length);
-  if (g_logEnabled) {
-    Serial.printf("[RX D->P] %s\n", g_lastRx.c_str());
-  }
-
-  if (g_soloState == SOLO_WAIT_CHALLENGE && length >= 13 &&
-      pData[0] == 0x55 && pData[1] == 0xAA &&
-      pData[2] == 0x04 && pData[3] == 0x10 && pData[4] == 0x11 &&
-      pData[5] == 0x04 && pData[6] == 0x00) {
-    const uint8_t ch[4] = {pData[7], pData[8], pData[9], pData[10]};
-    Serial.printf("[SOLO] Challenge: %02X %02X %02X %02X\n", ch[0], ch[1], ch[2], ch[3]);
-    if (sendSoloAuthFromChallenge(ch)) {
-      g_soloState = SOLO_WAIT_AUTH_ACK;
-      g_initStepMs = millis();
-      Serial.println("[SOLO] Auth sent");
-    } else {
-      Serial.println("[SOLO] Auth send failed");
-      g_soloState = SOLO_FAILED;
-    }
-  } else if (g_soloState == SOLO_WAIT_AUTH_ACK && length >= 10 &&
-             pData[0] == 0x55 && pData[1] == 0xAA &&
-             pData[3] == 0x10 && pData[4] == 0x11 &&
-             pData[5] == 0x20 && pData[7] == 0x00) {
-    Serial.println("[SOLO] Auth ACK received");
-    g_soloState = SOLO_POST_INIT;
-    g_initStepMs = millis();
-    g_postInitStep = 0;
-  }
-
-  if (g_phoneConnected && g_charPhoneNotify) {
-    g_charPhoneNotify->setValue(pData, length);
-    g_charPhoneNotify->notify();
-    g_txDisplayToPhone++;
-  } else {
-    // In standalone mode this is expected; avoid noisy logs.
-    if (!(g_soloState == SOLO_WAIT_CHALLENGE || g_soloState == SOLO_WAIT_AUTH_ACK ||
-          g_soloState == SOLO_POST_INIT || g_soloState == SOLO_RUN_POLL)) {
-      g_errors++;
-      Serial.println("[WARN] Phone not connected, drop notify");
-    }
-  }
-}
-
-static bool connectRealDisplay() {
-  NimBLEAddress addr(REAL_DISPLAY_MAC);
-
-  if (!g_client) {
-    g_client = NimBLEDevice::createClient();
-    g_client->setClientCallbacks(new ClientCallbacks(), false);
-    g_client->setConnectionParams(12, 24, 0, 200);
-    g_client->setConnectTimeout(8);
-  }
-
-  if (!g_client->connect(addr, false)) {
-    Serial.println("[ERR] Cannot connect real display");
-    g_errors++;
-    return false;
-  }
-
-  NimBLERemoteService *svc = g_client->getService(NUS_SERVICE_UUID);
-  if (!svc) {
-    Serial.println("[ERR] NUS service not found on display");
-    g_errors++;
-    g_client->disconnect();
-    return false;
-  }
-
-  g_charDisplayWrite = svc->getCharacteristic(NUS_RX_UUID);
-  g_charDisplayNotify = svc->getCharacteristic(NUS_TX_UUID);
-
-  if (!g_charDisplayWrite || !g_charDisplayNotify) {
-    Serial.println("[ERR] NUS chars not found on display");
-    g_errors++;
-    g_client->disconnect();
-    return false;
-  }
-
-  if (g_charDisplayNotify->canNotify()) {
-    if (!g_charDisplayNotify->subscribe(true, onDisplayNotify)) {
-      Serial.println("[ERR] subscribe notify failed");
-      g_errors++;
-      g_client->disconnect();
-      return false;
-    }
-  } else {
-    Serial.println("[ERR] display notify char cannot notify");
-    g_errors++;
-    g_client->disconnect();
-    return false;
-  }
-
-  Serial.println("[OK] Real display connected + notify subscribed");
-  return true;
-}
 
 static void setupBleServer() {
   NimBLEDevice::init(ADV_NAME);
@@ -572,8 +562,6 @@ void setup() {
   spoofBleMacIfPossible();
   setupBleServer();
 
-  // Connect to real display immediately; reconnect logic in loop.
-  connectRealDisplay();
   drawUi();
 }
 
@@ -610,59 +598,29 @@ void loop() {
   }
   g_lastLightBtn = btnLight;
 
-  if (!g_displayConnected) {
-    static unsigned long lastRetry = 0;
-    if (millis() - lastRetry > 4000) {
-      lastRetry = millis();
-      Serial.println("[DISPLAY] Reconnect attempt...");
-      connectRealDisplay();
-    }
-  }
-
-  if (g_soloState == SOLO_WAIT_CHALLENGE && (millis() - g_initStepMs > 2000)) {
-    Serial.println("[SOLO] Timeout waiting challenge");
-    g_soloState = SOLO_FAILED;
-  } else if (g_soloState == SOLO_WAIT_AUTH_ACK && (millis() - g_initStepMs > 2000)) {
-    Serial.println("[SOLO] Timeout waiting auth ACK");
-    g_soloState = SOLO_FAILED;
-  } else if (g_soloState == SOLO_POST_INIT && (millis() - g_initStepMs > 180)) {
-    // Post-auth sequence observed in Bikego before periodic polling.
-    if (g_postInitStep == 0) {
-      static const uint8_t fA588[] = {0x55, 0xAA, 0x01, 0x11, 0xA5, 0x01, 0x88, 0x18, 0xA7, 0xFE};
-      writeDisplayFrame(fA588, sizeof(fA588));
-    } else if (g_postInitStep == 1) {
-      static const uint8_t fA518[] = {0x55, 0xAA, 0x01, 0x11, 0xA5, 0x01, 0x18, 0x18, 0x17, 0xFF};
-      writeDisplayFrame(fA518, sizeof(fA518));
-    } else if (g_postInitStep == 2) {
-      static const uint8_t fF101[] = {0x55, 0xAA, 0x01, 0x11, 0xF1, 0x01, 0x01, 0x1A, 0xE0, 0xFE};
-      writeDisplayFrame(fF101, sizeof(fF101));
-    } else {
-      g_pollMode = true;
-      g_soloState = SOLO_RUN_POLL;
-      g_lastPollTxMs = 0;
-      Serial.println("[SOLO] Enter polling");
-    }
-    g_postInitStep++;
-    g_initStepMs = millis();
-  }
-
-  if (g_pollMode && g_soloState == SOLO_RUN_POLL && g_displayConnected && (millis() - g_lastPollTxMs > 500)) {
-    g_lastPollTxMs = millis();
-    pollDisplayOnce();
+  if (g_phoneConnected && (millis() - g_lastNotifyMs > 400)) {
+    g_lastNotifyMs = millis();
+    if (g_speedRaw < 220) g_speedRaw += 2;
+    else g_speedRaw = 0;
+    sendState15();
+    sendState10();
   }
 
   if (g_lightStep != 0 && g_displayConnected) {
     unsigned long now = millis();
     if (g_lightStep == 1) {
-      if (writeA5Value(0xA6, 0x01)) Serial.println("[LIGHT] ON");
+      g_light = 1;
+      Serial.println("[LIGHT] ON");
       g_lightStep = 2;
       g_lightStepMs = now;
     } else if (g_lightStep == 2 && (now - g_lightStepMs) > 350) {
-      if (writeA5Value(0xA6, 0x00)) Serial.println("[LIGHT] OFF");
+      g_light = 0;
+      Serial.println("[LIGHT] OFF");
       g_lightStep = 3;
       g_lightStepMs = now;
     } else if (g_lightStep == 3 && (now - g_lightStepMs) > 350) {
-      if (writeA5Value(0xA6, 0x01)) Serial.println("[LIGHT] ON");
+      g_light = 1;
+      Serial.println("[LIGHT] ON");
       g_lightStep = 0;
       Serial.println("[LIGHT] Sequence done");
     }
