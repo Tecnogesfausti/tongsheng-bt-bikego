@@ -1,0 +1,15 @@
+# Android/Gradle
+**/.gradle/
+**/build/
+**/local.properties
+**/*.iml
+
+# PlatformIO
+**/.pio/
+**/.pio-core/
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
