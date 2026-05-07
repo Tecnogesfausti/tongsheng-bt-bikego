@@ -246,6 +246,15 @@ static void sendA5WriteAck(uint8_t off) {
   sendNotifyFrame(r, sizeof(r));
 }
 
+static void sendA5ReadByteResp(uint8_t off, uint8_t val) {
+  // Observed format: 55 AA 01 A5 11 04 <off> <val> <crc_lo> <crc_hi>
+  uint8_t r[10] = {0x55, 0xAA, 0x01, 0xA5, 0x11, 0x04, off, val, 0x00, 0x00};
+  uint16_t crc = bikegoCrc16Like(r, sizeof(r));
+  r[8] = (uint8_t)(crc & 0xFF);
+  r[9] = (uint8_t)(crc >> 8);
+  sendNotifyFrame(r, sizeof(r));
+}
+
 static void sendPollAck(uint8_t off, uint8_t val) {
   uint8_t r[10] = {0x55, 0xAA, 0x01, 0x10, 0x11, 0x05, off, val, 0x00, 0x00};
   uint16_t crc = bikegoCrc16Like(r, sizeof(r));
@@ -462,7 +471,8 @@ class PhoneWriteCallbacks : public NimBLECharacteristicCallbacks {
     if (rawLen >= 10 && raw[0] == 0x55 && raw[1] == 0xAA && raw[3] == 0x11 && raw[4] == 0xA5 && raw[5] == 0x01) {
       if (raw[6] == 0x88) sendA5ReadResp88();
       if (raw[6] == 0x18) sendA5ReadResp18();
-      if (raw[6] == 0xE0) sendA5WriteAck(0xE0);
+      if (raw[6] == 0xE0) sendA5ReadByteResp(0xE0, g_unitMph);
+      if (raw[6] == 0x1C) sendA5ReadByteResp(0x1C, g_brightness);
       return;
     }
     // A5 write
@@ -483,6 +493,7 @@ class PhoneWriteCallbacks : public NimBLECharacteristicCallbacks {
     }
     // Poll requests 42/46
     if (rawLen >= 13 && raw[0] == 0x55 && raw[1] == 0xAA && raw[3] == 0x11 && raw[4] == 0x10 && raw[5] == 0x02) {
+      if (raw[6] == 0x3E) sendPollAck(0x3E, 0x01);
       if (raw[6] == 0x42) sendPollAck(0x42, 0x01);
       if (raw[6] == 0x46) sendPollAck(0x46, 0x00);
       return;
