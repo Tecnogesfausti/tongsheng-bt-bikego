@@ -14,6 +14,16 @@ Base: proyecto `esp32c3-ble-bridge`.
 
 Este proyecto parte del bridge funcional y se usa como rama de trabajo para evolucionar a mock completo.
 
+## SDK/Framework estable (importante)
+
+Para evitar reinicios/panics observados con combinaciones más nuevas, este mock queda fijado a:
+
+- PlatformIO `espressif32@2023.10.3`
+- Arduino-ESP32 `2.0.14` (resuelto por la plataforma)
+- ESP-IDF `4.4.6` (resuelto por la plataforma)
+
+No usar "última versión publicada" sin validar primero estabilidad BLE.
+
 ## Compilar y subir
 
 ```bash
